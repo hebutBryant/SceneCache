@@ -214,8 +214,12 @@ class MultimodalDataItem:
 
     modality: Modality
     hash: int = None
+    split_hash: List[int] = None
     pad_value: int = None
     offsets: Optional[list] = None
+    
+    # For qwen-vl
+    image_grid_thw: Union[torch.Tensor, np.ndarray] = None
 
     # the raw features returned by processor, e.g. pixel_values or audio_features
     feature: Union[torch.Tensor, np.ndarray] = None
@@ -257,7 +261,9 @@ class MultimodalDataItem:
         Set the pad value after first hashing the data
         """
         from sglang.srt.managers.mm_utils import hash_feature
-
+        part_pixel_nums = torch.prod(self.image_grid_thw, dim=1).tolist()
+        cur_idx = 0
+        
         if self.hash is None:
             if self.feature is not None:
                 hashed_feature = self.feature
@@ -265,6 +271,14 @@ class MultimodalDataItem:
                 hashed_feature = self.precomputed_embeddings
             self.hash = hash_feature(hashed_feature)
         assert self.hash is not None
+        for cur_len in part_pixel_nums:
+            cur_hash = hash_feature(self.feature[cur_idx:cur_idx+cur_len, :])
+            cur_idx += cur_len
+            if self.split_hash is None:
+                self.split_hash = [cur_hash]
+            else:
+                self.split_hash.append(cur_hash)
+        assert cur_idx == self.feature.shape[0]
         self.pad_value = self.hash % (1 << 30)
 
     def is_modality(self, modality: Modality) -> bool:

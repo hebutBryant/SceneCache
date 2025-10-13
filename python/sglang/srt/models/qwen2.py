@@ -51,6 +51,9 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.utils import add_prefix, make_layers
 
+from sglang.srt.managers.mock_kv_manager import mock_kv_manager
+import torch.nn.functional as F
+
 Qwen2Config = None
 
 
@@ -109,6 +112,7 @@ class Qwen2Attention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         prefix: str = "",
+        recompute_ratio_in_layer: list = [],
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -170,20 +174,107 @@ class Qwen2Attention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
+        self.layer_id = layer_id
+        self.mock_kv_manager = mock_kv_manager
+        self.recompute_ratio_in_layer = recompute_ratio_in_layer
+        self.max_recompute_layer_id = torch.argmax(torch.tensor(self.recompute_ratio_in_layer)).item()
+        self.is_max_recompute_layer = max(self.recompute_ratio_in_layer) == self.recompute_ratio_in_layer[self.layer_id]
+
+    def maybe_write_kv(
+        self, 
+        k: torch.Tensor, 
+        v: torch.Tensor, 
+        write_info: list
+    ) -> None:
+        if write_info is not None and self.layer_id in write_info:
+            k_contiguous = k.contiguous()
+            v_contiguous = v.contiguous()
+            for (start_idx, end_idx, uid_k, uid_v) in write_info[self.layer_id]:
+                part_k = k_contiguous[start_idx: end_idx + 1, :]
+                part_v = v_contiguous[start_idx: end_idx + 1, :]
+                
+                torch.cuda.synchronize() # this is essential to initialize tensor in cuda to avoid get wrong data from pace
+                self.mock_kv_manager.write_kv(part_k, uid_k, non_blocking=True)
+                self.mock_kv_manager.write_kv(part_v, uid_v, non_blocking=True)
+                #FIXME: we need rank info here to write pace in tp, in this case, maybe we need to check where all tp rank has write suceess
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        compute_mask_dict: dict[str, torch.Tensor] = None,
+        recompute_info: list[torch.Tensor] = [],
+        write_info: list = [],
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
-        output, _ = self.o_proj(attn_output)
+        if recompute_info is not None and self.layer_id in recompute_info:
+            if self.is_max_recompute_layer:
+                compute_mask = compute_mask_dict[self.max_recompute_layer_id] #max_compute
+            else:
+                compute_mask = compute_mask_dict[self.max_recompute_layer_id] #max_compute
+                cur_compute_mask = compute_mask_dict[self.layer_id] #current layer
+                relative_mask = torch.searchsorted(torch.where(compute_mask)[0], torch.where(cur_compute_mask)[0])
+            if self.layer_id == 0:
+                k, v = recompute_info[self.layer_id]
+                compute_hidden_states = hidden_states[compute_mask]
+                qkv_part, _ = self.qkv_proj(compute_hidden_states)
+                q, k_part, v_part = qkv_part.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                # only k/v part is new compute, which ought to store
+                self.maybe_write_kv(k_part, v_part, write_info)
+                q_pe, k_part_pe = self.rotary_emb(positions[:,compute_mask], q.contiguous(), k_part.contiguous())
+                dumb_q = torch.empty(k.shape, device=k.device, dtype=k.dtype)
+                dumb_q_pe, k_pe = self.rotary_emb(positions, dumb_q, k)
+                if self.is_max_recompute_layer:
+                    k_pe[compute_mask, :] = k_part_pe
+                    v[compute_mask, :] = v_part
+                    q = q_pe
+                    k = k_pe
+                    attn_output = self.attn(q, k, v, forward_batch)
+                    output, _ = self.o_proj(attn_output)
+                else:
+                    k_pe[cur_compute_mask, :] = k_part_pe[relative_mask]
+                    v[cur_compute_mask, :] = v_part[relative_mask]
+                    q = q_pe
+                    k = k_pe
+                    attn_output = self.attn(q[relative_mask], k, v, forward_batch)
+                    output, _ = self.o_proj(attn_output)
+                    final_output = torch.zeros((q.shape[0], hidden_states.shape[1]), dtype=hidden_states.dtype, device=hidden_states.device)
+                    final_output[relative_mask] = output
+                    output = final_output
+            else:
+                k, v = recompute_info[self.layer_id]
+                qkv_part, _ = self.qkv_proj(hidden_states)
+                q, k_part, v_part = qkv_part.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                # only k/v part is new compute, which ought to store
+                self.maybe_write_kv(k_part, v_part, write_info)
+                q_pe, k_part_pe = self.rotary_emb(positions[:,compute_mask], q.contiguous(), k_part.contiguous())
+                dumb_q = torch.empty(k.shape, device=k.device, dtype=k.dtype)
+                dumb_q_pe, k_pe = self.rotary_emb(positions, dumb_q, k)
+                if self.is_max_recompute_layer:
+                    k_pe[compute_mask, :] = k_part_pe
+                    v[compute_mask, :] = v_part
+                    q = q_pe
+                    k = k_pe
+                    attn_output = self.attn(q, k, v, forward_batch)
+                    output, _ = self.o_proj(attn_output)
+                else:
+                    k_pe[cur_compute_mask, :] = k_part_pe[relative_mask]
+                    v[cur_compute_mask, :] = v_part[relative_mask]
+                    q = q_pe
+                    k = k_pe
+                    attn_output = self.attn(q[relative_mask], k, v, forward_batch)
+                    output, _ = self.o_proj(attn_output)
+                    final_output = torch.zeros((q.shape[0], hidden_states.shape[1]), dtype=hidden_states.dtype, device=hidden_states.device)
+                    final_output[relative_mask] = output
+                    output = final_output
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            self.maybe_write_kv(k, v, write_info)
+            q, k = self.rotary_emb(positions, q, k)
+            attn_output = self.attn(q, k, v, forward_batch)
+            output, _ = self.o_proj(attn_output)
         return output
-
 
 class Qwen2DecoderLayer(nn.Module):
     def __init__(
@@ -203,6 +294,16 @@ class Qwen2DecoderLayer(nn.Module):
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
         )
+        recompute_ratio_in_layer = getattr(config, "recompute_ratio_in_layer", 0.3)
+        if isinstance(recompute_ratio_in_layer, float):
+            assert recompute_ratio_in_layer >= 0 and recompute_ratio_in_layer <= 1
+            recompute_ratio_in_layer = [recompute_ratio_in_layer for i in range(config.num_hidden_layers)]
+        else:
+            assert isinstance(recompute_ratio_in_layer, list)
+            assert len(recompute_ratio_in_layer) == config.num_hidden_layers
+            assert all(a >= b for a, b in zip(recompute_ratio_in_layer, recompute_ratio_in_layer[1:]))
+            assert min(recompute_ratio_in_layer) >= 0 and max(recompute_ratio_in_layer) <= 1
+
         self.self_attn = Qwen2Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -215,6 +316,7 @@ class Qwen2DecoderLayer(nn.Module):
             quant_config=quant_config,
             dual_chunk_attention_config=dual_chunk_attention_config,
             prefix=add_prefix("self_attn", prefix),
+            recompute_ratio_in_layer=recompute_ratio_in_layer,
         )
         self.mlp = Qwen2MLP(
             hidden_size=self.hidden_size,
@@ -227,6 +329,7 @@ class Qwen2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.mock_kv_manager = self.self_attn.mock_kv_manager
 
     def forward(
         self,
@@ -235,6 +338,11 @@ class Qwen2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        
+        compute_mask = forward_batch.compute_mask
+        recompute_info = forward_batch.recompute_info
+        write_info = forward_batch.write_info
+
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -245,7 +353,13 @@ class Qwen2DecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            compute_mask_dict=compute_mask,
+            recompute_info=recompute_info,
+            write_info=write_info,
         )
+        if compute_mask is not None and self.self_attn.layer_id in compute_mask:
+            if residual.shape[0] != hidden_states.shape[0]:
+                residual = residual[compute_mask[self.self_attn.max_recompute_layer_id]]
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)

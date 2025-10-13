@@ -59,6 +59,8 @@ from sglang.srt.models.qwen3_vl import (
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
+from sglang.srt.managers.mock_kv_manager import mock_kv_manager
+
 logger = logging.getLogger(__name__)
 
 cached_get_processor = lru_cache(get_processor)
@@ -75,12 +77,29 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
         self.hidden_size = config.hidden_size
+        self.mock_kv_manager = mock_kv_manager
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
+        
+        # according to MultimodalDataItem, 'One MultimodalDataItem contains all inputs for one modality', 
+        # which mean len(items) == 1 when there is only image modality. 
+        # however, due to the RoPE in vision attn, here we only try to save image_embeds for each request, 
+        # rather than for each image.
+        if len(items) == 1:
+            uid_vit_emb = str(items[0].hash) + "_vit_emb"
+            if uid_vit_emb in self.mock_kv_manager.uuid_to_pace:
+                image_embeds = torch.ones(
+                        (items[0].pixel_values.shape[0] // self.visual.spatial_merge_unit, self.config.vision_config.out_hidden_size), 
+                        device = self.visual.device, 
+                        dtype = self.visual.dtype)
+                torch.cuda.synchronize() # this is essential to initialize tensor in cuda to avoid get wrong data from pace
+                self.mock_kv_manager.get_kv(image_embeds, uid_vit_emb, non_blocking=False)
+                return image_embeds
+
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
@@ -88,6 +107,11 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        if len(items) == 1:
+            # here directly write to pace because do not return in above
+            image_embeds_contiguous = image_embeds.contiguous()
+            torch.cuda.synchronize() # this is essential to initialize tensor in cuda to avoid get wrong data from pace
+            self.mock_kv_manager.write_kv(image_embeds_contiguous, uid_vit_emb, non_blocking=True)
         return image_embeds
 
     def forward(
@@ -111,6 +135,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
+        compute_mask = forward_batch.compute_mask
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer]
         ):
@@ -130,10 +155,16 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             # process deepstack
             if input_deepstack_embeds is not None and layer_idx in range(3):
                 sep = self.hidden_size * layer_idx
-                hidden_states = (
-                    hidden_states
-                    + input_deepstack_embeds[:, sep : sep + self.hidden_size]
-                )
+                if compute_mask is not None and layer_idx in compute_mask:
+                    hidden_states = (
+                        hidden_states
+                        + input_deepstack_embeds[compute_mask[layer.self_attn.max_recompute_layer_id], sep : sep + self.hidden_size]
+                    )
+                else:
+                    hidden_states = (
+                        hidden_states
+                        + input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                    )
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -198,6 +229,8 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # deepstack
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
+
+        self.mock_kv_manager = mock_kv_manager
 
     @property
     def use_deepstack(self) -> bool:

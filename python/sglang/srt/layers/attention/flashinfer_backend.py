@@ -48,10 +48,12 @@ if is_flashinfer_available():
         BatchPrefillWithPagedKVCacheWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
         fast_decode_plan,
+        VariableBlockSparseAttentionWrapper,
     )
     from flashinfer.cascade import merge_state
     from flashinfer.decode import _get_range_buf, get_seq_lens
 
+from sglang.srt.managers.mock_kv_manager import mock_kv_manager
 
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
@@ -197,6 +199,18 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_wrappers_paged = []
         self.prefill_wrappers_verify = []
         self.decode_wrappers = []
+        self.prefill_wrappers_variable_block_dict = {}
+
+        recompute_ratio_in_layer = getattr(model_runner.model_config.hf_config, "recompute_ratio_in_layer", 0.3)
+        if isinstance(recompute_ratio_in_layer, float):
+            assert recompute_ratio_in_layer >= 0 and recompute_ratio_in_layer <= 1
+            recompute_ratio_in_layer = [recompute_ratio_in_layer for i in range(model_runner.model_config.num_hidden_layers)]
+        else:
+            assert isinstance(recompute_ratio_in_layer, list)
+            assert len(recompute_ratio_in_layer) == model_runner.model_config.num_hidden_layers
+            assert all(a >= b for a, b in zip(recompute_ratio_in_layer, recompute_ratio_in_layer[1:]))
+            assert min(recompute_ratio_in_layer) >= 0 and max(recompute_ratio_in_layer) <= 1
+        self.recompute_ratio_in_layer = recompute_ratio_in_layer
         for _ in range(self.num_wrappers):
             if not skip_prefill:
                 self.prefill_wrappers_paged.append(
@@ -212,6 +226,11 @@ class FlashInferAttnBackend(AttentionBackend):
                         "NHD",
                     )
                 )
+                for i in range(model_runner.model_config.num_hidden_layers):
+                    if self.recompute_ratio_in_layer[i] not in self.prefill_wrappers_variable_block_dict:
+                        self.prefill_wrappers_variable_block_dict[self.recompute_ratio_in_layer[i]] = VariableBlockSparseAttentionWrapper(
+                            self.workspace_buffer,
+                        )
             self.decode_wrappers.append(
                 BatchDecodeWithPagedKVCacheWrapper(
                     self.workspace_buffer,
@@ -282,26 +301,43 @@ class FlashInferAttnBackend(AttentionBackend):
 
             if self.is_multimodal:
                 use_ragged = False
-                extend_no_prefix = False
-            else:
-                use_ragged = not self.enable_deterministic
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
-
-            self.indices_updater_prefill.update(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_cpu,
-                forward_batch.seq_lens_sum,
-                prefix_lens,
-                prefill_wrappers=self.prefill_wrappers_paged,
-                use_ragged=use_ragged,
-                encoder_lens=forward_batch.encoder_lens,
-                spec_info=None,
-                fixed_split_size=self.prefill_split_tile_size,
-            )
-            self.forward_metadata = PrefillMetadata(
-                self.prefill_wrappers_paged, use_ragged, extend_no_prefix
-            )
+            else:
+                use_ragged = True
+                extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+            
+            # fixme: use config to choose
+            if True:
+                self.indices_updater_prefill.update(
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.seq_lens_cpu,
+                    forward_batch.seq_lens_sum,
+                    prefix_lens,
+                    prefill_wrappers=self.prefill_wrappers_variable_block_dict,
+                    use_ragged=use_ragged,
+                    encoder_lens=forward_batch.encoder_lens,
+                    spec_info=None,
+                    forward_batch=forward_batch,
+                )
+                self.forward_metadata = PrefillMetadata(
+                    self.prefill_wrappers_variable_block_dict, use_ragged, extend_no_prefix
+                )
+            else:
+                self.indices_updater_prefill.update(
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.seq_lens_cpu,
+                    forward_batch.seq_lens_sum,
+                    prefix_lens,
+                    prefill_wrappers=self.prefill_wrappers_paged,
+                    use_ragged=use_ragged,
+                    encoder_lens=forward_batch.encoder_lens,
+                    spec_info=None,
+                )
+                self.forward_metadata = PrefillMetadata(
+                    self.prefill_wrappers_paged, use_ragged, extend_no_prefix
+                )
 
     def init_cuda_graph_state(
         self,
@@ -507,7 +543,7 @@ class FlashInferAttnBackend(AttentionBackend):
         save_kv_cache=True,
     ):
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
-            self._get_wrapper_idx(layer)
+            self.recompute_ratio_in_layer[layer.layer_id]
         ]
         cache_loc = (
             forward_batch.out_cache_loc
@@ -519,30 +555,125 @@ class FlashInferAttnBackend(AttentionBackend):
 
         q = q.contiguous()
         if not self.forward_metadata.use_ragged:
-            if k is not None:
-                assert v is not None
-                if save_kv_cache:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+            # fixme: use config to choose
+            if True:
+                # fixme: in radix cache, here need to get former kv from token_to_kv_pool
+                if self.forward_metadata.extend_no_prefix:
+                    o = prefill_wrapper_paged.run(
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim).transpose(0,1),
+                        k.view(-1, layer.tp_k_head_num, layer.head_dim).transpose(0,1),
+                        v.view(-1, layer.tp_v_head_num, layer.head_dim).transpose(0,1)
                     )
+                    o = o.transpose(0,1).contiguous() #head_num, token, head_dim
+                else:
+                    # support chunked prefill (radix cache no test)
+                    o1, s1 = prefill_wrapper_paged.run(
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim).transpose(0,1),
+                        k.view(-1, layer.tp_k_head_num, layer.head_dim).transpose(0,1),
+                        v.view(-1, layer.tp_v_head_num, layer.head_dim).transpose(0,1),
+                        return_lse=True
+                    )
+                    o1 = o1.transpose(0,1).contiguous() #head_num, token, head_dim
+                    s1 = s1.transpose(0,1).contiguous() #head_num, token
 
-            o = prefill_wrapper_paged.forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=not layer.is_cross_attention,
-                sm_scale=layer.scaling,
-                window_left=layer.sliding_window_size,
-                logits_soft_cap=logits_soft_cap,
-                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
-            )
+                    # erxi: currently, to support chunked prefill, we need to cal attn result of current q and old k/v, but
+                    # using BatchPrefillWithPagedKVCacheWrapper and VariableBlockSparseAttentionWrapper at the same time will
+                    # cause illegal memory access during inference, thus here only use a torch implementation which is adapt
+                    # from torch_native_backend and should be improve in future.
+                    def cal_chunk(
+                        query: torch.Tensor,
+                        output: torch.Tensor,
+                        lse: torch.Tensor,
+                        k_cache: torch.Tensor,
+                        v_cache: torch.Tensor,
+                        req_to_token: torch.Tensor,
+                        req_pool_indices: torch.Tensor,
+                        seq_lens: torch.Tensor,
+                        extend_seq_lens: torch.Tensor,
+                        orig_seq_lens: torch.Tensor,
+                        ):
+                        # [num_q_tokens, num_heads, head_size] -> [num_heads, num_q_tokens, head_size]
+                        query = query.movedim(0, query.dim() - 2)
+                        start_q, start_kv = 0, 0
+                        num_qo_heads, _ , head_dim = query.shape #fixme
+                        num_kv_heads = k_cache.shape[1]
+                        for seq_idx in range(seq_lens.shape[0]):
+                            # TODO: this loop process a sequence per iter, this is inefficient.
+                            # Need optimize the performance later.
+
+                            extend_seq_len_q = extend_seq_lens[seq_idx]
+                            seq_len_kv = seq_lens[seq_idx]
+                            end_q = start_q + extend_seq_len_q
+                            end_kv = start_kv + seq_len_kv
+                            
+                            if extend_seq_len_q == orig_seq_lens[seq_idx]:
+                                start_q, start_kv = end_q, end_kv
+                                continue
+                            per_req_query = query[:, start_q:end_q, :]
+
+                            # get key and value from cache. per_req_tokens contains the kv cache
+                            # index for each token in the sequence.
+                            req_pool_idx = req_pool_indices[seq_idx]
+                            per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
+                            per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2) # [num_heads, num_kv_tokens, head_size]
+                            per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2) # [num_heads, num_kv_tokens, head_size]
+                            if num_qo_heads != num_kv_heads:
+                                per_req_key = per_req_key.repeat_interleave(num_qo_heads // num_kv_heads, dim=0)
+                                per_req_value = per_req_value.repeat_interleave(num_qo_heads // num_kv_heads, dim=0)
+
+                            attn_scores = torch.matmul(per_req_query, per_req_key.transpose(-2, -1)) / (head_dim ** 0.5) # [num_heads, num_q_tokens, num_kv_tokens]
+                            attn_lse = torch.logsumexp(attn_scores, dim=-1) # [num_heads, num_q_tokens]
+                            attn_lse = attn_lse.transpose(0, 1) # [num_q_tokens, num_q_tokens]
+                            attn_lse /= 0.6931 # div by ln2 because logsumexp in flashinfer_backend differs from that of torch_native_backend
+                            attn_weights = torch.softmax(attn_scores, dim=-1) # [num_heads, num_q_tokens, num_kv_tokens]
+                            attn_weights[torch.isnan(attn_weights)] = 0
+                            per_req_out = torch.matmul(attn_weights, per_req_value)  # [num_heads, num_q_tokens, head_size]
+                            per_req_out = per_req_out.movedim(query.dim() - 2, 0) #[num_q_tokens, num_heads, head_size]
+
+                            output[start_q:end_q, :, :] = per_req_out
+                            lse[start_q:end_q, :] = attn_lse
+                            start_q, start_kv = end_q, end_kv
+
+                    o2 = torch.zeros((o1.shape[0], layer.tp_q_head_num, layer.head_dim), dtype=q.dtype, device=q.device)
+                    s2 = torch.zeros((o1.shape[0], layer.tp_q_head_num), dtype=q.dtype, device=q.device)
+
+                    cal_chunk(
+                        q.clone().view(-1, layer.tp_q_head_num, layer.head_dim),
+                        o2,
+                        s2,
+                        forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                        forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                        forward_batch.req_to_token_pool.req_to_token,
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        forward_batch.extend_seq_lens,
+                        forward_batch.orig_seq_lens,
+                        )
+                    o, _ = merge_state(o1, s1, o2, s2)
+
+                # save kvcache after this chunk is calculated
+                if k is not None:
+                    assert v is not None
+                    if save_kv_cache:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        )
+            else:
+                o = prefill_wrapper_paged.forward(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    causal=not layer.is_cross_attention,
+                    sm_scale=layer.scaling,
+                    window_left=layer.sliding_window_size,
+                    logits_soft_cap=logits_soft_cap,
+                    k_scale=layer.k_scale,
+                    v_scale=layer.v_scale,
+                )
         else:
             causal = True
             if layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
                 causal = False
-
             if self.forward_metadata.extend_no_prefix:
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
@@ -891,7 +1022,6 @@ class FlashInferIndicesUpdaterDecode:
         if locally_override:
             global_override_indptr_cpu = None
 
-
 class FlashInferIndicesUpdaterPrefill:
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
         # Parse Constants
@@ -923,6 +1053,16 @@ class FlashInferIndicesUpdaterPrefill:
         else:
             assert self.attn_backend.num_wrappers == 1
             self.update = self.update_single_wrapper
+        
+        # fixme: use config to choose
+        if True:
+            self.update = self.update_variable_block_wrapper
+
+        self.mock_kv_manager = mock_kv_manager
+        self.layer_ids = list(range(model_runner.model_config.num_hidden_layers))
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.recompute_ratio_in_layer = attn_backend.recompute_ratio_in_layer
+        self.max_recompute_layer_id = torch.argmax(torch.tensor(self.recompute_ratio_in_layer)).item()
 
     def update(
         self,
@@ -940,6 +1080,194 @@ class FlashInferIndicesUpdaterPrefill:
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
 
+    def update_variable_block_wrapper(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        seq_lens_sum: int,
+        prefix_lens: torch.Tensor,
+        prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
+        use_ragged: bool,
+        encoder_lens: Optional[torch.Tensor],
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        forward_batch,
+    ):
+        # here consider different layer may have different sparse pattern, this can be more concise if sparse pattern is all the same
+        block_compute_list = [[] for i in self.layer_ids]
+        block_compute_list_valid_cumsum = [[] for i in self.layer_ids]
+        block_compute_list_total_cumsum = [[] for i in self.layer_ids]
+        compute_num_list = [[] for i in self.layer_ids]
+        actual_extend_seq_len = []
+        
+        compute_mask = {}
+        recompute_info = {}
+        write_info = {}
+        
+        if forward_batch.forward_mode.is_extend():
+            compute_mask_list = [torch.ones(forward_batch.input_ids.shape[0], dtype=torch.bool, device=forward_batch.input_ids.device) for i in self.layer_ids] #here can use empty? 
+            retrived_k_list = [torch.zeros((forward_batch.input_ids.shape[0], self.kv_size), dtype=self.data_type, device=forward_batch.input_ids.device) for i in self.layer_ids]
+            retrived_v_list = [torch.zeros((forward_batch.input_ids.shape[0], self.kv_size), dtype=self.data_type, device=forward_batch.input_ids.device) for i in self.layer_ids]
+
+            for mm_inputs, prefix_len, start_loc, seq_len, orig_seq_len in zip(forward_batch.mm_inputs, 
+                                                                               forward_batch.extend_prefix_lens_cpu,
+                                                                               forward_batch.extend_start_loc.tolist(),
+                                                                               forward_batch.extend_seq_lens.tolist(),
+                                                                               forward_batch.orig_seq_lens.tolist(),
+                                                                               ):
+                last_idx = 0 #for each req, it should start from 0, fix me to start_loc
+                #last_idx = start_loc
+                current_actual_seq_len = 0
+                current_actual_skip_seq_len = 0
+                if mm_inputs is None:
+                    continue
+                for item in mm_inputs.mm_items:
+                    for cur_hash, (start_idx, end_idx) in zip(item.split_hash, item.offsets):
+                        start_idx -= prefix_len
+                        end_idx -= prefix_len
+
+                        if start_idx < 0:
+                            continue # adapt to radix cache, should not update kvcache
+
+                        if end_idx > seq_len - 1:
+                            continue
+
+                        reuse_happened = False
+                        for layer_id in self.layer_ids:
+                            recompute_ratio = self.recompute_ratio_in_layer[layer_id]
+                            total_token_num =  end_idx - start_idx + 1
+                            recompute_token_num = max(1, int(total_token_num*recompute_ratio))
+                            reuse_start = start_idx + recompute_token_num
+                            reuse_end = end_idx + 1
+
+                            uid_k = "_".join([str(cur_hash), str(layer_id), "k"])
+                            uid_v = "_".join([str(cur_hash), str(layer_id), "v"])
+                            if uid_k in self.mock_kv_manager.uuid_to_pace and uid_v in self.mock_kv_manager.uuid_to_pace:
+                                # this should update part of retrived_k/v,
+                                # here can be imporve, because former 30% will be recompute later
+                                # we can only write and read the latter 70%
+                                part_k = retrived_k_list[layer_id][start_loc + start_idx: start_loc + reuse_end]
+                                part_v = retrived_v_list[layer_id][start_loc + start_idx: start_loc + reuse_end]
+                                torch.cuda.synchronize() #this is essential to initialize tensor in cuda to avoid get wrong data from pace
+                                assert part_k.shape[0] == reuse_end - start_idx
+                                self.mock_kv_manager.get_kv(part_k, uid_k, non_blocking=False)
+                                self.mock_kv_manager.get_kv(part_v, uid_v, non_blocking=False)
+                                
+                                # fixme: here assume all req in a batch either all cached, or all no cached
+                                reuse_happened=True
+                                
+                                if start_idx != last_idx:
+                                    block_compute_list[layer_id].extend([1, 0]) #text + image_recompute, image_reuse
+                                    compute_num_list[layer_id].extend([reuse_start - last_idx, reuse_end - reuse_start])
+                                    if layer_id == self.layer_ids[0]:
+                                        current_actual_seq_len += reuse_start - last_idx
+                                        current_actual_skip_seq_len += reuse_end - reuse_start
+                                else:
+                                    block_compute_list[layer_id].extend([1, 0]) #image_recompute, image_reuse
+                                    compute_num_list[layer_id].extend([recompute_token_num, reuse_end - reuse_start])
+                                    if layer_id == self.layer_ids[0]:
+                                        current_actual_seq_len += recompute_token_num
+                                        current_actual_skip_seq_len += reuse_end - reuse_start
+
+                                # fixme: here assume all req in a batch either all cached, or all no cached
+                                compute_mask_list[layer_id][start_loc + reuse_start: start_loc + reuse_end] = False
+                                if layer_id not in recompute_info:
+                                    recompute_info[layer_id] = [retrived_k_list[layer_id], retrived_v_list[layer_id]]
+                                    
+                                if layer_id not in compute_mask:
+                                    compute_mask[layer_id] = compute_mask_list[layer_id]
+                            else:
+                                # when somewhat image is reused, q tensor will be compressed in future,
+                                # which mean we need to revise write info here
+                                real_start_idx = start_idx - current_actual_skip_seq_len
+                                real_end_idx = end_idx - current_actual_skip_seq_len
+
+                                if layer_id not in write_info:  
+                                    write_info[layer_id] = [[real_start_idx, real_end_idx, uid_k, uid_v]]
+                                else:
+                                    write_info[layer_id].append([real_start_idx, real_end_idx, uid_k, uid_v])
+
+                                # fixme: even kvcache not in pace, we can skip attn(img, k, v)
+
+                        if reuse_happened:
+                            last_idx = reuse_end
+                for layer_id in self.layer_ids:
+                    if last_idx != seq_len:
+                        block_compute_list[layer_id].append(1)
+                        compute_num_list[layer_id].append(seq_len-last_idx)
+                        if layer_id == self.layer_ids[0]:
+                            current_actual_seq_len += seq_len-last_idx
+                    block_compute_list_valid_cumsum[layer_id].append(sum(block_compute_list[layer_id]))
+                    block_compute_list_total_cumsum[layer_id].append(len(block_compute_list[layer_id]))
+
+                # when one req in a batch ends, update actual_extend_seq_len, here just use layer[-1] info
+                if current_actual_seq_len != 0:
+                    actual_extend_seq_len.append(current_actual_seq_len)
+                else:
+                    actual_extend_seq_len.append(seq_len)
+        
+        if actual_extend_seq_len != [] and block_compute_list[0] != [1] and 0 in compute_mask:
+            assert compute_mask[0].sum() == sum(actual_extend_seq_len)
+
+        forward_batch.compute_mask = compute_mask
+        forward_batch.recompute_info = recompute_info
+        forward_batch.write_info = write_info
+        if actual_extend_seq_len != []:
+            forward_batch.actual_extend_seq_len = torch.tensor(actual_extend_seq_len, dtype=torch.int32).cuda()
+        
+        #fixme: here assume block_compute_list and compute_num_list are all the same for every layer
+        processed_ratio = {}
+        for layer_id in self.layer_ids:
+            recompute_ratio = self.recompute_ratio_in_layer[layer_id]
+            if recompute_ratio in processed_ratio:
+                continue
+            else:
+                processed_ratio[recompute_ratio] = True
+            cur_block_compute_list = block_compute_list[layer_id]
+            cur_compute_num_list = compute_num_list[layer_id]
+            if cur_block_compute_list == []: # all req do not have image modality
+                cur_block_compute_list = [1]
+                cur_compute_num_list = [seq_lens_sum]
+
+            # fixme: here should consider conbine successive 0,0 or 1,1? e.g. [1,1,1,1,0]->[1,0]
+            # but currently 0,0 situation should not happend?
+
+            # e.g. block_compute_list=[1,1,0,1], compute_num_list = [2,3,7,2]
+            # final mask map should be 3*4, [[1,0,0,0],[1,1,0,0],[1,1,1,1]]
+            # in this cause, block_row_sz should be [2,3,2]; block_col_sz should be [2,3,7,2]
+
+            block_num = len(cur_block_compute_list)
+            row_mask = torch.tensor(cur_block_compute_list, dtype=torch.bool)
+            block_mask_map = torch.tril(torch.ones(block_num, block_num, dtype=torch.bool), diagonal=0)  # [n, n]
+            block_mask_map = block_mask_map[row_mask].to("cuda:0")# fixme: device
+
+            # mask out cross attn between different reqs in a batch
+            for si, ei in zip(block_compute_list_valid_cumsum[layer_id][:-1], block_compute_list_total_cumsum[layer_id][:-1]):
+                block_mask_map[si:, :ei] = False
+
+            block_mask_map = block_mask_map.repeat(self.num_kv_heads, 1, 1)
+            block_row_sz = (torch.tensor(cur_compute_num_list, dtype=torch.int32)).to("cuda:0")# fixme: device
+            block_row_sz = block_row_sz[row_mask]
+            block_row_sz = block_row_sz.repeat(self.num_kv_heads,1)
+            block_col_sz = (torch.tensor([cur_compute_num_list], dtype=torch.int32)).to("cuda:0")# fixme: device
+            block_col_sz = block_col_sz.repeat(self.num_kv_heads,1)
+
+            assert not use_ragged
+            prefill_wrappers[recompute_ratio].plan(
+                block_mask_map,
+                block_row_sz,
+                block_col_sz,
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                causal=True,
+                # fixme: some kwargs maybe need to pass in future
+                non_blocking=True,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.data_type,
+            )
+
+    
     def update_single_wrapper(
         self,
         req_pool_indices: torch.Tensor,

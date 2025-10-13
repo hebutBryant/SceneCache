@@ -62,6 +62,8 @@ from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
+from sglang.srt.managers.mock_kv_manager import mock_kv_manager
+
 logger = logging.getLogger(__name__)
 
 
@@ -521,11 +523,24 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
+        self.mock_kv_manager = mock_kv_manager
+
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        if len(items) == 1:
+            uid_vit_emb = str(items[0].hash) + "_vit_emb"
+            if uid_vit_emb in self.mock_kv_manager.uuid_to_pace:
+                image_embeds = torch.ones(
+                        (items[0].pixel_values.shape[0] // self.visual.spatial_merge_unit, self.config.vision_config.out_hidden_size),
+                        device = self.visual.device,
+                        dtype = self.visual.dtype)
+                torch.cuda.synchronize() # this is essential to initialize tensor in cuda to avoid get wrong data from pace
+                self.mock_kv_manager.write_kv(image_embeds, uid_vit_emb, non_blocking=False)
+                return image_embeds
+    
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
@@ -534,6 +549,11 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        if len(items) == 1:
+            # here directly write to pace because do not return in above
+            image_embeds_contiguous = image_embeds.contiguous()
+            torch.cuda.synchronize() # this is essential to initialize tensor in cuda to avoid get wrong data from pace
+            self.mock_kv_manager.write_kv(image_embeds_contiguous, uid_vit_emb, non_blocking=True)
         return image_embeds
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:

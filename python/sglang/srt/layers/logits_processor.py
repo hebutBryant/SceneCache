@@ -122,6 +122,8 @@ class LogitsMetadata:
     # Number of tokens to sample per DP rank
     global_num_tokens_for_logprob_cpu: Optional[torch.Tensor] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+
+    actual_extend_seq_len: Optional[torch.Tensor] = None
     # The gather mode for DP attention
     dp_padding_mode: Optional[DpPaddingMode] = None
     # for padding
@@ -175,6 +177,7 @@ class LogitsMetadata:
             global_dp_buffer_len=forward_batch.global_dp_buffer_len,
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
+            actual_extend_seq_len=forward_batch.actual_extend_seq_len,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
         )
 
@@ -273,18 +276,21 @@ class LogitsProcessor(nn.Module):
         ):
             # Prefill without input logprobs.
             if logits_metadata.padded_static_len < 0:
-                last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+                if logits_metadata.actual_extend_seq_len is not None:
+                    last_index = torch.cumsum(logits_metadata.actual_extend_seq_len, dim=0) - 1
+                else:
+                    last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
             else:
                 # If padding_static length is 5 and extended_seq_lens is [2, 3],
                 # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
                 # and this retrieves t01 and t12, which are the valid last tokens
                 idx = torch.arange(
-                    len(logits_metadata.extend_seq_lens),
+                    len(logits_metadata.actual_extend_seq_len),
                     device=logits_metadata.extend_seq_lens.device,
                 )
                 last_index = (
                     idx * logits_metadata.padded_static_len
-                    + logits_metadata.extend_seq_lens
+                    + logits_metadata.actual_extend_seq_len
                     - 1
                 )
             pruned_states = hidden_states[last_index]

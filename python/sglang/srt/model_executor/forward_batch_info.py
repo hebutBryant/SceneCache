@@ -303,6 +303,11 @@ class ForwardBatch:
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
+    compute_mask = None
+    recompute_info = None
+    write_info = None
+    actual_extend_seq_len = None
+    
     @classmethod
     def init_new(
         cls,

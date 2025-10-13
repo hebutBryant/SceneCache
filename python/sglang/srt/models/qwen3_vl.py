@@ -46,6 +46,8 @@ from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
+from sglang.srt.managers.mock_kv_manager import mock_kv_manager
+
 logger = logging.getLogger(__name__)
 
 # === Vision Encoder === #
@@ -552,6 +554,7 @@ class Qwen3LLMModel(Qwen3Model):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
+        compute_mask = forward_batch.compute_mask
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer]
         ):
@@ -574,10 +577,18 @@ class Qwen3LLMModel(Qwen3Model):
                 and layer_idx in self.deepstack_embed_to_decoder_layer
             ):
                 sep = self.hidden_size * layer_idx
-                hidden_states = (
-                    hidden_states
-                    + input_deepstack_embeds[:, sep : sep + self.hidden_size]
-                )
+                if compute_mask is not None and layer_idx in compute_mask:
+                    # here fix for adaptive recompute, use the max recompute ratio because hidden state is passed as it is, maybe can be improve.
+                    hidden_states = (
+                        hidden_states
+                        + input_deepstack_embeds[compute_mask[layer.self_attn.max_recompute_layer_id], sep : sep + self.hidden_size]
+                    )
+
+                else:
+                    hidden_states = (
+                        hidden_states
+                        + input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                    )
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -644,6 +655,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
 
+        self.mock_kv_manager = mock_kv_manager
+
     @property
     def use_deepstack(self) -> bool:
         return hasattr(self, "deepstack_visual_indexes")
@@ -668,10 +681,58 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             self.visual.dtype
         )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
-        assert pixel_values.dim() == 2, pixel_values.dim()
-        assert image_grid_thw.dim() == 2, image_grid_thw.dim()
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-        return image_embeds
+
+        if len(items) == 1:
+            image_mask = torch.ones(image_grid_thw.shape[0]).bool()
+            cur_image = 0
+
+            part_pixel_nums = torch.prod(items[0].image_grid_thw, dim=1).tolist()
+            cur_idx = 0
+            image_embeds = torch.ones(
+                    (items[0].feature.shape[0] // self.visual.spatial_merge_unit, self.config.vision_config.out_hidden_size * self.visual.spatial_merge_unit),
+                    device = self.visual.device,
+                    dtype = self.visual.dtype)
+            compute_mask = torch.ones(pixel_values.shape[0]).bool()
+            torch.cuda.synchronize() # this is essential to initialize tensor in cuda to avoid get wrong data from pace
+
+            cached_image = 0
+            for cur_hash, cur_len in zip(items[0].split_hash, part_pixel_nums):
+                uid_vit_emb = str(cur_hash) + "_vit_emb"
+                if uid_vit_emb in self.mock_kv_manager.uuid_to_pace:
+                    self.mock_kv_manager.get_kv(image_embeds[cur_idx//self.visual.spatial_merge_unit: (cur_idx+cur_len)//self.visual.spatial_merge_unit], uid_vit_emb, non_blocking=False)
+                    compute_mask[cur_idx: cur_idx+cur_len] = False
+                    image_mask[cur_image] = False
+                    cached_image += 1
+
+                cur_image += 1
+                cur_idx += cur_len
+
+            if cached_image == len(part_pixel_nums): #all image is already cached
+                return image_embeds
+
+            #if cached_image == 0: #fixme: skip using mask, because all image need compute
+            #    pass
+
+            assert pixel_values.dim() == 2, pixel_values.dim()
+            assert image_grid_thw.dim() == 2, image_grid_thw.dim()
+            part_image_embeds = self.visual(pixel_values[compute_mask], grid_thw=image_grid_thw[image_mask])
+            image_embeds[compute_mask[0::4]] = part_image_embeds
+
+            cur_idx = 0
+            for cur_hash, cur_len in zip(items[0].split_hash, part_pixel_nums):
+                uid_vit_emb = str(cur_hash) + "_vit_emb"
+                if uid_vit_emb not in self.mock_kv_manager.uuid_to_pace:
+                    image_embeds_contiguous = image_embeds[cur_idx // self.visual.spatial_merge_unit: (cur_idx + cur_len) // self.visual.spatial_merge_unit, :].contiguous()
+                    torch.cuda.synchronize() # this is essential to initialize tensor in cuda to avoid get wrong data from pace
+                    self.mock_kv_manager.write_kv(image_embeds_contiguous, uid_vit_emb, non_blocking=True)
+                cur_idx += cur_len
+
+            return image_embeds
+        else:
+            assert pixel_values.dim() == 2, pixel_values.dim()
+            assert image_grid_thw.dim() == 2, image_grid_thw.dim()
+            image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+            return image_embeds
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
