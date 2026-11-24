@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import triton
@@ -307,6 +307,8 @@ class ForwardBatch:
     recompute_info = None
     write_info = None
     actual_extend_seq_len = None
+    scene_graph_capture: Optional[Any] = None
+    optimized_visual_kv: Optional[Any] = None
     
     @classmethod
     def init_new(

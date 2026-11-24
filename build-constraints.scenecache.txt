@@ -1,0 +1,3 @@
+# FlashInfer 0.4 requests torch in its isolated build environment.
+# Keep that build on the same torch version as the runtime.
+torch==2.8.0

@@ -1,0 +1,699 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>整图 KV 复用的细节问答对照 · SceneCache</title>
+<style>
+:root {
+  color-scheme: light;
+  --ink: #17293a;
+  --muted: #506477;
+  --paper: #fffefa;
+  --background: #eff3f5;
+  --line: #d7e1e9;
+  --navy: #18354e;
+  --blue: #245988;
+  --blue-soft: #eaf2f9;
+  --green: #186044;
+  --green-soft: #e7f4ec;
+  --red: #9c3829;
+  --red-soft: #faebe4;
+  --accent: #d3943b;
+  --radius: 18px;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  color: var(--ink);
+  background: var(--background);
+  font-family: Inter, "Noto Sans CJK SC", "Microsoft YaHei", system-ui, sans-serif;
+  line-height: 1.75;
+  overflow-wrap: anywhere;
+}
+a { color: var(--blue); text-underline-offset: 4px; }
+button, select { font: inherit; }
+button { cursor: pointer; }
+button:focus-visible, select:focus-visible, summary:focus-visible, a:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 3px;
+}
+h1, h2, h3, p { margin: 0; }
+h1, h2, h3 { line-height: 1.35; text-wrap: balance; }
+h2 { font-size: clamp(22px, 3vw, 30px); letter-spacing: -.025em; }
+h3 { font-size: 17px; }
+[hidden] { display: none !important; }
+.wrap { width: min(1160px, calc(100% - 64px)); margin: auto; }
+.top { border-bottom: 1px solid #ffffff25; }
+.topline { display: flex; min-height: 61px; align-items: center; justify-content: space-between; gap: 18px; }
+.topline strong { letter-spacing: .1em; font-size: .85rem; white-space: nowrap; }
+.actions { display: flex; gap: .6rem; flex-wrap: wrap; }
+.hero { background: var(--navy); color: #fff; }
+.hero-main { padding: 48px 0 46px; display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(275px, .7fr); gap: 36px; align-items: center; }
+.hero h1 { max-width: 730px; font-size: clamp(32px, 5vw, 58px); letter-spacing: -.045em; }
+.hero p { margin-top: 18px; color: #e3edf3; max-width: 660px; }
+.hero .eyebrow { color: #e4ad60; margin-bottom: 12px; font-weight: 700; font-size: .84rem; letter-spacing: .08em; }
+.summary { border: 1px solid #ffffff35; border-radius: var(--radius); padding: 22px; background: #ffffff0b; }
+.summary a { color: #fff; font-weight: 700; }
+.summary .metrics { margin-top: 16px; display: grid; gap: 12px; grid-template-columns: 1fr 1fr; }
+.hero .summary .metric span { color: #d4e3ed; }
+.metric b { display: block; font-size: 1.75rem; line-height: 1.25; font-variant-numeric: tabular-nums; }
+.metric span { display: block; color: var(--muted); font-size: .81rem; line-height: 1.45; }
+.secondary { border: 1px solid var(--line); color: var(--ink); background: var(--paper); border-radius: 9px; padding: 7px 12px; font-size: .83rem; }
+.secondary:hover { border-color: var(--blue); }
+.hero .secondary { border-color: #ffffff55; color: #fff; background: transparent; }
+.hero .secondary:hover { background: #ffffff12; }
+main { padding-bottom: 52px; }
+section { scroll-margin-top: 16px; margin-top: 33px; }
+.section-intro { margin: 9px 0 16px; color: var(--muted); max-width: 880px; }
+.panel { border: 1px solid var(--line); border-radius: var(--radius); background: var(--paper); }
+.image-buttons { display: flex; gap: 8px; flex-wrap: wrap; margin: 17px 0 12px; }
+.image-buttons button { border: 1px solid var(--line); border-radius: 10px; padding: 9px 14px; color: var(--ink); background: var(--paper); }
+.image-buttons button[aria-pressed="true"] { color: #fff; background: var(--navy); border-color: var(--navy); }
+.case-choice { display: flex; align-items: center; gap: 12px; padding: 15px 19px; border-bottom: 1px solid var(--line); }
+.case-choice label { font-weight: 700; white-space: nowrap; font-size: .86rem; }
+.case-choice select { width: min(460px, 100%); min-width: 0; border: 1px solid var(--line); border-radius: 9px; padding: 7px 10px; color: var(--ink); background: var(--paper); }
+.case-grid { display: grid; grid-template-columns: minmax(0, 1.18fr) minmax(0, 1fr); }
+.visual, .answers { min-width: 0; padding: 20px; }
+.visual { border-right: 1px solid var(--line); }
+.toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px; }
+.toolbar button[aria-pressed="true"] { border-color: var(--navy); background: var(--blue-soft); color: var(--navy); }
+.image-shell { position: relative; isolation: isolate; overflow: hidden; border-radius: 12px; background: #dce4eb; }
+.image-shell img { width: 100%; height: auto; display: block; }
+.box { position: absolute; z-index: 2; border: 3px solid #ffcf6d; background: transparent; box-shadow: 0 0 0 1px #2b1d07; pointer-events: none; }
+.mask {
+  position: absolute; inset: 0; z-index: 1; display: grid;
+  grid-template-columns: repeat(var(--cols), minmax(0, 1fr));
+  grid-template-rows: repeat(var(--rows), minmax(0, 1fr));
+  pointer-events: none;
+}
+.mask span { background: #1c786d52; border: .5px solid #ffffff56; }
+.mask span.new { background: #1c4d99a0; }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 17px; font-size: .78rem; color: var(--muted); margin: 10px 0; }
+.legend i { display: inline-block; width: 12px; height: 12px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+.legend .gold { border: 2px solid #ad782e; }
+.legend .blue { background: #315e99; }
+.legend .green { background: #258476; }
+.crop-row { margin-top: 14px; display: flex; align-items: center; gap: 13px; }
+.crop { position: relative; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; width: min(150px, 37%); flex: 0 0 auto; }
+.crop img { display: block; position: absolute; max-width: none; }
+.caption { font-size: .81rem; color: var(--muted); }
+.status { display: inline-flex; align-items: center; border-radius: 100px; padding: 3px 9px; font-weight: 700; font-size: .77rem; background: var(--blue-soft); color: var(--blue); line-height: 1.6; }
+.status.right { background: var(--green-soft); color: var(--green); }
+.status.wrong { background: var(--red-soft); color: var(--red); }
+.answers > .status { margin-bottom: 8px; }
+.question { font-weight: 700; margin: 10px 0; }
+.options { padding-left: 1.4rem; margin: 0 0 13px; color: var(--muted); font-size: .85rem; }
+.ground { color: var(--ink); background: #faf1df; border-radius: 9px; padding: 9px 12px; border: 1px solid #efe0c4; font-size: .9rem; }
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 13px; }
+.response { background: var(--background); border: 1px solid transparent; border-radius: 10px; padding: 11px; min-width: 0; }
+.response.correct { border-color: #c1dfcc; background: var(--green-soft); }
+.response.incorrect { border-color: #efd0c6; background: var(--red-soft); }
+.response h3 { font-size: .87rem; margin-bottom: 5px; }
+.response .caption { margin-top: 6px; }
+.response .meaning { margin-left: .5em; font-size: .82rem; font-weight: 700; }
+.raw { white-space: pre-wrap; font-size: .91rem; overflow-wrap: anywhere; }
+.explain { color: var(--muted); font-size: .85rem; margin-top: 12px; }
+.case-detail { border-top: 1px solid var(--line); padding: 16px 20px; }
+.case-detail summary { cursor: pointer; font-weight: 700; }
+.case-detail[open] summary { margin-bottom: 8px; }
+.case-detail .raw { margin: 5px 0 12px; }
+.metrics-strip { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; padding: 16px 20px; border-top: 1px solid var(--line); background: #f8fafb; border-radius: 0 0 var(--radius) var(--radius); }
+.metrics-strip b { font-size: 1.3rem; }
+.repeats { margin-top: 9px; }
+.control-card { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-top: 10px; }
+.control-card h3 { font-size: .94rem; }
+.control-card .pair { margin-top: 8px; }
+.control-card .status { margin-left: 8px; }
+.reading-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 14px; }
+.reading-grid article { padding: 19px; }
+.reading-grid p { margin-top: 7px; font-size: .93rem; }
+.analysis-copy { padding: 19px; margin-top: 14px; }
+.analysis-copy p { white-space: pre-wrap; }
+.analysis-copy p + p { margin-top: 13px; }
+.all-details summary { cursor: pointer; padding: 15px 19px; font-weight: 700; }
+.table-scroll { overflow: auto; }
+table { border-collapse: collapse; width: 100%; font-size: .85rem; text-align: left; }
+caption { text-align: left; padding: 10px 18px; color: var(--muted); }
+th, td { padding: 10px 14px; border-top: 1px solid var(--line); vertical-align: top; }
+th { background: #f8fafb; }
+td:last-child, th:last-child { white-space: nowrap; }
+.case-link { color: var(--blue); border: none; background: transparent; font-weight: 700; padding: 0; text-align: left; text-decoration: underline; text-underline-offset: 3px; }
+.source-list { margin: 13px 0 0; padding: 14px 17px 14px 37px; font-size: .88rem; }
+.source-list li + li { margin-top: 4px; }
+footer { border-top: 1px solid var(--line); padding: 20px 0; color: var(--muted); font-size: .81rem; }
+@media (max-width: 870px) {
+  .hero-main, .case-grid { grid-template-columns: 1fr; }
+  .hero-main { gap: 20px; padding: 39px 0; }
+  .visual { border-right: 0; border-bottom: 1px solid var(--line); }
+}
+@media (max-width: 600px) {
+  .wrap { width: calc(100% - 32px); }
+  .topline { min-height: 65px; }
+  .topline strong { letter-spacing: .035em; }
+  .topline .actions { gap: 5px; justify-content: flex-end; }
+  .topline .secondary { padding: 6px 8px; font-size: .73rem; white-space: nowrap; }
+  .hero-main { padding: 27px 0; }
+  .reading-grid { grid-template-columns: 1fr; }
+  .metrics-strip { grid-template-columns: repeat(2, 1fr); }
+  .case-choice, .visual, .answers, .case-detail, .metrics-strip { padding-left: 14px; padding-right: 14px; }
+  .table-scroll table { min-width: 610px; }
+}
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+@media print {
+  :root { --background: #fff; }
+  .actions, .toolbar, .image-buttons, .case-choice { display: none; }
+  .hero { color: var(--ink); background: transparent; }
+  .hero p, .hero .summary .metric span { color: var(--muted); }
+  .hero h1 { font-size: 30px; }
+  .hero .eyebrow, .summary a { color: var(--blue); }
+  .hero-main { padding: 12px 0; }
+  .visual, .answers, .reading-grid article { break-inside: avoid; }
+  .wrap { width: 100%; }
+  .box, .mask { print-color-adjust: exact; }
+}
+</style>
+</head>
+<body data-server-no-reload>
+<header class="hero">
+  <div class="top"><div class="wrap topline">
+    <strong>SceneCache · 实验报告</strong>
+    <div class="actions">
+      <button class="secondary" id="download" type="button">下载实验数据</button>
+      <button class="secondary" id="print" type="button">打印 / PDF</button>
+    </div>
+  </div></div>
+  <div class="wrap hero-main">
+    <div>
+      <div class="eyebrow">同一图片 · 先问主体，再问细节</div>
+      <h1>整图 KV 复用会影响哪些细节回答？</h1>
+      <p id="heroResult"></p>
+    </div>
+    <aside class="summary" aria-label="实验结果概览">
+      <a href="#explorer" id="featuredLink">查看对照案例</a>
+      <div class="metrics">
+        <div class="metric"><b id="nCases"></b><span>完成对照的细节题</span></div>
+        <div class="metric"><b id="nFailures"></b><span>冷算正确、复用后错误</span></div>
+      </div>
+    </aside>
+  </div>
+</header>
+<main class="wrap">
+  <section id="explorer" aria-labelledby="explorerTitle">
+    <h2 id="explorerTitle">原图与逐题对照</h2>
+    <p class="section-intro">两组回答使用同一张图和同一道细节题。图中的框指向可以核对答案的位置。</p>
+    <div class="image-buttons" id="imageButtons" role="group" aria-label="选择图片"></div>
+    <div class="panel">
+      <div class="case-choice">
+        <label for="caseChoice">细节题</label>
+        <select id="caseChoice"></select>
+      </div>
+      <div class="case-grid">
+        <div class="visual">
+          <div class="toolbar" role="group" aria-label="图片显示方式">
+            <button class="secondary" type="button" id="boxToggle" aria-pressed="true">标出答案区域</button>
+            <button class="secondary" type="button" id="maskToggle" aria-pressed="false">显示重算位置</button>
+          </div>
+          <div class="image-shell">
+            <img id="photo" alt="">
+            <div class="mask" id="mask" hidden aria-hidden="true"></div>
+            <div class="box" id="box" hidden aria-hidden="true"></div>
+          </div>
+          <div class="legend">
+            <span id="boxLegend"><i class="gold"></i>原图证据区域</span>
+            <span id="computeLegend" hidden><i class="blue"></i>重新计算</span>
+            <span id="reuseLegend" hidden><i class="green"></i>沿用前一次的 K/V</span>
+          </div>
+          <div class="crop-row" id="cropRow" hidden>
+            <div class="crop" id="crop"><img id="cropImage" alt=""></div>
+            <p class="caption" id="cropCaption"></p>
+          </div>
+          <p class="caption" id="maskCaption" hidden>按第一层实测 token 掩码投影到图像网格。颜色表示是否重新计算对应 token。</p>
+        </div>
+        <article class="answers" aria-live="polite">
+          <span class="status" id="verdict"></span>
+          <h3 id="caseTitle"></h3>
+          <p class="question" id="question"></p>
+          <ul class="options" id="options"></ul>
+          <p class="ground" id="ground"></p>
+          <div class="pair">
+            <div class="response" id="coldCard"><h3>清除图像 KV 后</h3><p><span id="cold" class="raw"></span><span id="coldMeaning" class="meaning" hidden></span></p><p class="caption" id="coldTrace" hidden></p></div>
+            <div class="response" id="warmCard"><h3>复用旧图像 KV</h3><p><span id="warm" class="raw"></span><span id="warmMeaning" class="meaning" hidden></span></p><p class="caption" id="warmTrace" hidden></p></div>
+          </div>
+          <p class="explain" id="caseNote" hidden></p>
+        </article>
+      </div>
+      <details class="case-detail" id="seedPanel">
+        <summary>查看建立缓存时的主体问题与回答</summary>
+        <span class="status right" id="seedVerified" hidden>主体回答与画面一致</span>
+        <p class="explain">主体问题</p><p id="mainQuestion" class="raw"></p>
+        <p class="explain">主体问题的模型回答</p><p id="seedAnswer" class="raw"></p>
+      </details>
+      <details class="case-detail" id="repeatPanel" hidden>
+        <summary>查看重复实验</summary>
+        <div class="table-scroll repeats"><table>
+          <thead><tr><th scope="col">轮次</th><th scope="col">清除 KV 后</th><th scope="col">复用后</th></tr></thead>
+          <tbody id="repeatRows"></tbody>
+        </table></div>
+      </details>
+      <details class="case-detail" id="controlPanel" hidden>
+        <summary>查看控制实验</summary>
+        <div id="controlRows"></div>
+      </details>
+      <div id="traceStrip" class="metrics-strip">
+        <div class="metric"><b id="traceTotal"></b><span>视觉 token</span></div>
+        <div class="metric"><b id="traceNew"></b><span>每层重新计算</span></div>
+        <div class="metric"><b id="traceReused"></b><span>每层复用</span></div>
+        <div class="metric"><b id="traceLayers"></b><span>命中的解码层</span></div>
+        <div class="metric"><b id="traceReads"></b><span>读取的 K/V 张量</span></div>
+      </div>
+    </div>
+  </section>
+  <section aria-labelledby="interpretationTitle">
+    <h2 id="interpretationTitle">怎样理解这组差异</h2>
+    <div class="reading-grid">
+      <article class="panel">
+        <h3>问题变了，图像 token 的上下文也变了</h3>
+        <p>当文字问题排在图片之前时，因果注意力允许图像 token 读取问题文本。较深层的图像 K/V 因而可能包含旧问题的上下文。主体提问用得到的信息，和局部颜色、标记或空间关系题所依赖的信息可能不同。</p>
+      </article>
+      <article class="panel">
+        <h3>固定重算范围可能覆盖不到新问题的证据</h3>
+        <p>这个分支按图像 token 顺序选择一段重算。若新问题的证据落在复用区域，该处仍沿用由旧上下文产生的 K/V。对照可以显示复用与答案变化同时发生。验证注意力是否偏向画面主体，需要另外采集注意力或干预对应区域。</p>
+      </article>
+    </div>
+  </section>
+  <section aria-labelledby="methodTitle">
+    <h2 id="methodTitle">实验口径</h2>
+    <div class="panel analysis-copy">
+      <p id="method"></p>
+      <p id="verification" hidden></p>
+      <p class="explain">这些题用于在用户提供的三张图里寻找具体反例，样本和提问方式均有限。汇总数字仅描述本报告的题目。</p>
+    </div>
+  </section>
+  <section aria-labelledby="allTitle">
+    <h2 id="allTitle">全部细节题</h2>
+    <p class="section-intro">保留了对两组均正确、均错误和只有一组正确的题目。点击题名可以跳到图片证据。</p>
+    <details class="panel all-details" id="allCasesPanel">
+      <summary id="allSummary"></summary>
+      <div class="table-scroll"><table id="allCases">
+        <thead><tr><th scope="col">图片</th><th scope="col">细节题</th><th scope="col">图中答案</th><th scope="col">清除 KV 后</th><th scope="col">复用后</th><th scope="col">对照结论</th></tr></thead>
+        <tbody id="caseRows"></tbody>
+      </table></div>
+    </details>
+  </section>
+  <section aria-labelledby="sourcesTitle" id="sources" hidden>
+    <h2 id="sourcesTitle">源码与参考</h2>
+    <ul id="sourceList" class="panel source-list"></ul>
+  </section>
+</main>
+<footer><div class="wrap" id="footerText"></div></footer>
+<script id="report-data" type="application/json">__REPORT_DATA__</script>
+<script>
+(() => {
+  "use strict";
+
+  const element = id => document.getElementById(id);
+  const data = JSON.parse(element("report-data").textContent);
+  const images = new Map(data.images.map(image => [image.id, image]));
+  const modelCases = data.cases || [];
+  const observedCases = modelCases.filter(item =>
+    typeof item.cold_correct === "boolean" && typeof item.warm_correct === "boolean");
+  const failures = observedCases.filter(item => item.cold_correct && !item.warm_correct);
+  const featured = modelCases.find(item => item.id === data.featured) || failures[0] || modelCases[0];
+  const storageKey = `scenecache-kv-report:${window.location.pathname}`;
+  const panelIds = ["seedPanel", "repeatPanel", "controlPanel", "allCasesPanel"];
+  let savedView;
+  try {
+    savedView = JSON.parse(sessionStorage.getItem(storageKey));
+  } catch {
+    // The report remains usable in browsers which block session storage.
+  }
+  let selectedCase = modelCases.find(item => item.id === savedView?.caseId) || featured;
+  let selectedImage = images.has(savedView?.imageId) ? savedView.imageId :
+    selectedCase?.image ?? data.images[0]?.id;
+  let showBox = savedView?.showBox !== false;
+  let showMask = savedView?.showMask === true;
+
+  function saveView() {
+    const state = {
+      imageId: selectedImage,
+      caseId: selectedCase?.id,
+      showBox,
+      showMask,
+      panels: Object.fromEntries(panelIds.map(id => [id, element(id).open]))
+    };
+    try {
+      sessionStorage.setItem(storageKey, JSON.stringify(state));
+    } catch {
+      // Some local file or private browsing modes disallow storage.
+    }
+  }
+
+  function setText(id, value) {
+    element(id).textContent = value ?? "—";
+  }
+
+  function status(item) {
+    if (typeof item.cold_correct !== "boolean" || typeof item.warm_correct !== "boolean") {
+      return ["待核对", ""];
+    }
+    if (item.cold_correct && !item.warm_correct) return ["复用后由对变错", "wrong"];
+    if (!item.cold_correct && item.warm_correct) return ["复用后由错变对", ""];
+    return item.cold_correct ? ["两组均正确", "right"] : ["两组均错误", ""];
+  }
+
+  function answerLabel(item, answer = item.answer) {
+    const rawAnswer = String(answer ?? "—");
+    const match = rawAnswer.match(/^([A-Z])(?:[.．、。\s]*)$/);
+    if (!match) return rawAnswer;
+    const option = item.options?.[match[1].charCodeAt(0) - 65];
+    if (!option) return rawAnswer;
+    return /^[A-Z][.．、:\s]/.test(option) ? option : `${match[1]}. ${option}`;
+  }
+
+  function updateResponse(name, item) {
+    const correctness = item[name + "_correct"];
+    const card = element(name + "Card");
+    card.classList.toggle("correct", correctness === true);
+    card.classList.toggle("incorrect", correctness === false);
+    setText(name, item[name]);
+    const meaning = element(name + "Meaning");
+    const option = typeof item[name] === "string" ? answerLabel(item, item[name]) : "";
+    meaning.hidden = !option || option === item[name];
+    meaning.textContent = meaning.hidden ? "" : option.replace(/^[A-Z][.．、:\s]\s*/, "");
+    const trace = name === "cold" ? item.cold_trace : item.trace;
+    const info = element(name + "Trace");
+    const details = [];
+    if (Number.isFinite(trace?.embedding_hits)) details.push(`视觉特征命中 ${trace.embedding_hits} 次`);
+    if (Number.isFinite(trace?.reads)) details.push(`图像 K/V 读取 ${trace.reads} 次`);
+    info.hidden = details.length === 0;
+    info.textContent = details.join(" · ");
+  }
+
+  function validBox(box) {
+    return Array.isArray(box) && box.length === 4 && box.every(Number.isFinite) &&
+      box[2] > 0 && box[3] > 0;
+  }
+
+  function drawPicture(item, image) {
+    element("photo").src = image.src;
+    element("photo").alt = image.label + "原图";
+    const box = item?.box;
+    const hasBox = validBox(box);
+    element("boxToggle").hidden = !hasBox;
+    element("box").hidden = !hasBox || !showBox;
+    element("boxLegend").hidden = !hasBox || !showBox;
+    element("cropRow").hidden = !hasBox;
+    if (hasBox) {
+      const [left, top, width, height] = box;
+      Object.assign(element("box").style, {
+        left: `${left * 100}%`,
+        top: `${top * 100}%`,
+        width: `${width * 100}%`,
+        height: `${height * 100}%`
+      });
+      const cropImage = element("cropImage");
+      cropImage.src = image.src;
+      cropImage.alt = "标注区域放大，核对 " + item.title;
+      element("crop").style.aspectRatio = `${image.width * width} / ${image.height * height}`;
+      Object.assign(cropImage.style, {
+        width: `${100 / width}%`,
+        left: `${-100 * left / width}%`,
+        top: `${-100 * top / height}%`
+      });
+      const roi = item.roi_counts;
+      const roiText = Number.isFinite(roi?.recomputed) && Number.isFinite(roi?.reused)
+        ? ` 中心落在证据框内的 token 中，${roi.recomputed} 个重算，${roi.reused} 个复用。`
+        : "";
+      setText("cropCaption", "标注区域放大。图中答案为 " + answerLabel(item) + "。" + roiText);
+    }
+    const trace = item?.trace;
+    const hasMask = Number.isInteger(trace?.rows) && Number.isInteger(trace?.cols) &&
+      trace.rows > 0 && trace.cols > 0 && Array.isArray(trace.mask) &&
+      trace.mask.length === trace.rows * trace.cols;
+    const mask = element("mask");
+    element("maskToggle").hidden = !hasMask;
+    mask.hidden = !hasMask || !showMask;
+    for (const id of ["computeLegend", "reuseLegend", "maskCaption"]) {
+      element(id).hidden = !hasMask || !showMask;
+    }
+    if (hasMask && showMask) {
+      mask.style.setProperty("--cols", trace.cols);
+      mask.style.setProperty("--rows", trace.rows);
+      const tiles = document.createDocumentFragment();
+      for (const recomputed of trace.mask) {
+        const tile = document.createElement("span");
+        if (recomputed) tile.className = "new";
+        tiles.append(tile);
+      }
+      mask.replaceChildren(tiles);
+    } else {
+      mask.replaceChildren();
+    }
+    element("boxToggle").setAttribute("aria-pressed", String(showBox));
+    element("maskToggle").setAttribute("aria-pressed", String(showMask));
+  }
+
+  function drawRepeats(item) {
+    const repeats = item?.repeats || [];
+    const rows = repeats.map((repeat, index) => {
+      const row = document.createElement("tr");
+      for (const value of [repeat.label ?? index + 1, repeat.cold, repeat.warm]) {
+        const cell = document.createElement("td");
+        cell.textContent = value ?? "—";
+        row.append(cell);
+      }
+      return row;
+    });
+    element("repeatRows").replaceChildren(...rows);
+    element("repeatPanel").hidden = rows.length === 0;
+    element("repeatPanel").open = false;
+  }
+
+  function drawControls(item) {
+    const controls = [
+      [item?.image_first, "图片在问题前", "两次请求都先放图再放问题，以改变图像 token 可读取的文字前文。"],
+      [item?.same_question, "用细节题本身建立缓存", "复用组沿用同一道细节题产生的 KV。"]
+    ];
+    const cards = [];
+    for (const [control, title, explanation] of controls) {
+      if (!control) continue;
+      const card = document.createElement("article");
+      card.className = "control-card";
+      const heading = document.createElement("h3");
+      heading.textContent = title;
+      const [verdict, css] = status(control);
+      const badge = document.createElement("span");
+      badge.className = "status " + css;
+      badge.textContent = verdict;
+      heading.append(badge);
+      const caption = document.createElement("p");
+      caption.className = "caption";
+      const reads = Number.isFinite(control.trace?.reads) ? `读取了 ${control.trace.reads} 份 K/V 张量。` : "";
+      caption.textContent = explanation + reads;
+      const pair = document.createElement("div");
+      pair.className = "pair";
+      for (const [name, label] of [["cold", "清除图像 KV 后"], ["warm", "复用旧图像 KV"]]) {
+        const response = document.createElement("div");
+        response.className = "response";
+        response.classList.toggle("correct", control[name + "_correct"] === true);
+        response.classList.toggle("incorrect", control[name + "_correct"] === false);
+        const subheading = document.createElement("h3");
+        subheading.textContent = label;
+        const paragraph = document.createElement("p");
+        paragraph.className = "raw";
+        paragraph.textContent = control[name] ?? "—";
+        response.append(subheading, paragraph);
+        pair.append(response);
+      }
+      card.append(heading, caption, pair);
+      cards.push(card);
+    }
+    element("controlRows").replaceChildren(...cards);
+    element("controlPanel").hidden = cards.length === 0;
+    element("controlPanel").open = false;
+  }
+
+  function drawCase() {
+    const image = images.get(selectedImage);
+    if (!image) return;
+    const item = selectedCase;
+    drawPicture(item, image);
+    const [verdict, css] = item ? status(item) : ["无观测", ""];
+    element("verdict").className = "status " + css;
+    setText("verdict", verdict);
+    setText("caseTitle", item?.title ?? "这张图没有可展示的对照题");
+    setText("question", item?.question ?? "");
+    const options = (item?.options || []).map((option, index) => {
+      const li = document.createElement("li");
+      li.textContent = /^[A-Z][.．、:\s]/.test(option) ? option : `${String.fromCharCode(65 + index)}. ${option}`;
+      return li;
+    });
+    element("options").replaceChildren(...options);
+    setText("ground", item ? "图中答案 · " + answerLabel(item) : "图中答案 · —");
+    if (item) {
+      updateResponse("cold", item);
+      updateResponse("warm", item);
+    } else {
+      updateResponse("cold", {});
+      updateResponse("warm", {});
+    }
+    setText("caseNote", item?.note ?? "");
+    element("caseNote").hidden = !item?.note;
+    element("seedPanel").hidden = !item?.main && !item?.seed;
+    element("seedPanel").open = item?.id === featured?.id;
+    element("seedVerified").hidden = item?.seed_correct !== true;
+    setText("mainQuestion", item?.main);
+    setText("seedAnswer", item?.seed);
+    drawRepeats(item);
+    drawControls(item);
+    const trace = item?.trace;
+    element("traceStrip").hidden = !trace;
+    setText("traceTotal", trace?.total);
+    setText("traceNew", trace?.recomputed);
+    setText("traceReused", trace?.reused);
+    setText("traceLayers", trace?.layers);
+    setText("traceReads", trace?.reads);
+  }
+
+  function selectImage(imageId, caseId) {
+    selectedImage = imageId;
+    const cases = modelCases.filter(item => item.image === imageId);
+    selectedCase = cases.find(item => item.id === caseId) ||
+      cases.find(item => item.cold_correct === true && item.warm_correct === false) ||
+      cases[0];
+    const choices = cases.map(item => {
+      const option = document.createElement("option");
+      option.value = item.id;
+      option.textContent = item.title;
+      return option;
+    });
+    const select = element("caseChoice");
+    select.replaceChildren(...choices);
+    select.disabled = choices.length === 0;
+    if (selectedCase) select.value = selectedCase.id;
+    for (const button of element("imageButtons").children) {
+      button.setAttribute("aria-pressed", String(button.dataset.image === imageId));
+    }
+    drawCase();
+    saveView();
+  }
+
+  for (const image of data.images) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.image = image.id;
+    button.textContent = image.label;
+    button.addEventListener("click", () => selectImage(image.id));
+    element("imageButtons").append(button);
+  }
+
+  for (const item of modelCases) {
+    const row = document.createElement("tr");
+    const image = images.get(item.image);
+    const [verdict, css] = status(item);
+    const values = [image?.label, item.title, answerLabel(item), item.cold, item.warm, verdict];
+    values.forEach((value, index) => {
+      const cell = document.createElement("td");
+      if (index === 1) {
+        const link = document.createElement("button");
+        link.type = "button";
+        link.className = "case-link";
+        link.textContent = value;
+        link.addEventListener("click", () => {
+          selectImage(item.image, item.id);
+          element("explorer").scrollIntoView();
+          element("caseChoice").focus({preventScroll: true});
+        });
+        cell.append(link);
+      } else if (index === 5) {
+        const label = document.createElement("span");
+        label.className = "status " + css;
+        label.textContent = value;
+        cell.append(label);
+      } else {
+        cell.textContent = value ?? "—";
+      }
+      row.append(cell);
+    });
+    element("caseRows").append(row);
+  }
+
+  setText("nCases", observedCases.length);
+  setText("nFailures", failures.length);
+  setText("allSummary", `展开 ${modelCases.length} 道细节题`);
+  if (featured?.cold_correct === true && featured?.warm_correct === false) {
+    const image = images.get(featured.image);
+    setText("heroResult", `在${image?.label ?? "这张图"}里，${featured.title}这道细节题清除旧图像 KV 后答对，复用主体问题留下的 KV 后答错。`);
+    setText("featuredLink", "打开反例 · " + featured.title);
+  } else if (failures.length) {
+    setText("heroResult", `在本次对照中，有 ${failures.length} 道细节题清除图像 KV 后回答正确，复用后出现错误。`);
+  } else {
+    setText("heroResult", "本次观测中尚未出现冷算正确、复用后错误的细节题。可查看实际答案与缓存追踪。");
+  }
+  setText("method", data.methodology);
+  if (data.verification) {
+    element("verification").hidden = false;
+    setText("verification", data.verification);
+  }
+  const sourceLinks = (data.source_links || []).filter(source => {
+    try {
+      const url = new URL(source.url || source.href);
+      return url.protocol === "https:" || url.protocol === "http:";
+    } catch {
+      return false;
+    }
+  });
+  for (const source of sourceLinks) {
+    const item = document.createElement("li");
+    const link = document.createElement("a");
+    link.href = source.url || source.href;
+    link.textContent = source.label || source.title || source.name || link.href;
+    link.rel = "noopener noreferrer";
+    link.target = "_blank";
+    item.append(link);
+    element("sourceList").append(item);
+  }
+  element("sources").hidden = sourceLinks.length === 0;
+  setText("footerText", data.generated_at
+    ? `SceneCache 本地推理对照 · ${data.generated_at.slice(0, 10)} · 图片与结果可离线查看`
+    : "SceneCache 本地推理对照 · 图片与结果可离线查看");
+
+  element("featuredLink").addEventListener("click", () => {
+    if (featured) selectImage(featured.image, featured.id);
+  });
+  element("caseChoice").addEventListener("change", event => selectImage(selectedImage, event.target.value));
+  element("boxToggle").addEventListener("click", () => {
+    showBox = !showBox;
+    drawPicture(selectedCase, images.get(selectedImage));
+    saveView();
+  });
+  element("maskToggle").addEventListener("click", () => {
+    showMask = !showMask;
+    drawPicture(selectedCase, images.get(selectedImage));
+    saveView();
+  });
+  element("print").addEventListener("click", () => window.print());
+  element("download").addEventListener("click", () => {
+    const evidence = {...data, images: data.images.map(({src, ...metadata}) => metadata)};
+    const url = URL.createObjectURL(new Blob([JSON.stringify(evidence, null, 2)], {type: "application/json"}));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "scenecache-kv-failure-evidence.json";
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
+  selectImage(selectedImage, selectedCase?.id);
+  for (const id of panelIds) {
+    const panel = element(id);
+    const wasOpen = savedView?.panels?.[id];
+    if (!panel.hidden && typeof wasOpen === "boolean") panel.open = wasOpen;
+    panel.addEventListener("toggle", saveView);
+  }
+  saveView();
+  window.addEventListener("pagehide", saveView);
+})();
+</script>
+</body>
+</html>

@@ -396,6 +396,13 @@ def _get_chunked_prefill_embedding(
                     "embedding size."
                 )
 
+        # The embedding cache retains the whole encoder result. Only this
+        # request's merger output is selected for its compact scheduler slots.
+        if len(embedding_items_per_req) == 1:
+            selected = getattr(embedding_items_per_req[0], "visual_kv_active_device", None)
+            if selected is not None:
+                embedding_per_req = embedding_per_req.index_select(0, selected)
+
         embedding_per_req_chunk, _, _ = get_embedding_chunk(
             embedding=embedding_per_req,
             extend_prefix_len=prefix_length[i],

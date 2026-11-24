@@ -43,6 +43,20 @@ class MockKVManager:
         self.uuid_to_pace: Dict[str, MockGAHandle] = collections.OrderedDict()
         self.uuid_to_tensor: Dict[str, torch.Tensor] = {}  # uuid -> tensor
         self.capacity = capacity
+
+    def snapshot_layer_pairs(self, image_hash, layer_ids):
+        """Retain immutable CPU references while the cache may evict its entries."""
+        with self.lock:
+            result = {}
+            for layer in layer_ids:
+                names = [f"{image_hash}_{layer}_{kind}" for kind in ("k", "v")]
+                if any(name not in self.uuid_to_tensor for name in names):
+                    return None
+                result[layer] = tuple(self.uuid_to_tensor[name] for name in names)
+            for layer in layer_ids:
+                for kind in ("k", "v"):
+                    self.uuid_to_pace.move_to_end(f"{image_hash}_{layer}_{kind}")
+            return result
     def write_kv(self, tensor: torch.Tensor, uuid, non_blocking=False):
         if tensor.device.type == 'cuda':
             tensor = tensor.contiguous().cpu()

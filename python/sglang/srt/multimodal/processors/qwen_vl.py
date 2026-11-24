@@ -1,7 +1,9 @@
 import asyncio
+import json
 import math
 import os
 import re
+from pathlib import Path
 from typing import List, Union
 
 import torch
@@ -255,6 +257,21 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
+        capture_dir = os.getenv("SGLANG_SCENE_GRAPH_CAPTURE_DIR")
+        visual_mode = os.getenv("SGLANG_VISUAL_KV_MODE", "legacy")
+        region_mode = visual_mode in {"region_reference", "region_pipeline", "region_pipeline_triton"}
+        if region_mode and base_output.images:
+            from sglang.srt.mem_cache.scene_graph_memory.selection import prepare_image
+
+            if len(base_output.images) != 1 or base_output.videos or not isinstance(base_output.images[0], Image.Image):
+                raise ValueError("The region KV backend accepts one decoded still image")
+            base_output.images = [prepare_image(base_output.images[0], os.environ["SGLANG_VISUAL_KV_MEMORY"])]
+        if capture_dir:
+            if (len(base_output.images) != 1 or not isinstance(base_output.images[0], Image.Image)
+                    or base_output.videos):
+                raise ValueError("Scene graph capture requires one decoded image")
+            submitted_size = base_output.images[0].size
+
         # Qwen-specific: resize images if they are raw Image objects
         if base_output.images and isinstance(base_output.images[0], Image.Image):
             resize_tasks = [resize_image_async(image) for image in base_output.images]
@@ -270,6 +287,27 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         )
 
         input_ids = input_ids.flatten()
+        if capture_dir:
+            (item,) = mm_items
+            processor = self._processor.image_processor
+            if any(getattr(processor, name, False) for name in ("do_center_crop", "do_pad")):
+                raise ValueError("Scene graph mapping currently supports resize-only image processors")
+            current = json.loads((Path(capture_dir) / "request.json").read_text())
+            (grid,) = item.image_grid_thw.tolist()
+            merge = self.hf_config.vision_config.spatial_merge_size
+            image_rows = math.prod(grid) // merge**2
+            if image_rows > current["max_image_tokens"] or input_ids.numel() + 1 >= current["context_length"]:
+                raise ValueError(
+                    f"Full image prefill exceeds configured budget ({image_rows} image tokens, "
+                    f"{input_ids.numel()} total); lower --max-image-edge or increase the token limits"
+                )
+            item["scene_graph_geometry"] = {
+                "submitted_size": list(submitted_size),
+                "fork_resize_size": list(base_output.images[0].size),
+                "processor_class": processor.__class__.__name__,
+                "processor_patch_size": processor.patch_size,
+                "processor_merge_size": processor.merge_size,
+            }
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
             image_token_id=self.mm_tokens.image_token_id,
@@ -285,6 +323,26 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             second_per_grid_ts=getattr(ret, "second_per_grid_ts", None),
         )
         mrope_positions = mrope_positions.squeeze(1)
+        if region_mode and base_output.images:
+            from sglang.srt.mem_cache.scene_graph_memory.selection import compact_inputs
+
+            (item,) = mm_items
+            should_measure = bool(os.getenv("SGLANG_VISUAL_KV_PROFILE"))
+            if should_measure:
+                from time import perf_counter_ns
+
+                from sglang.srt.mem_cache.scene_graph_memory.optimized_prefill import emit_metrics
+
+                selection_started = perf_counter_ns()
+            input_ids, mrope_positions, mrope_position_delta = compact_inputs(
+                item, input_ids, mrope_positions, mrope_position_delta,
+                os.environ["SGLANG_VISUAL_KV_MEMORY"], os.environ["SGLANG_VISUAL_KV_SELECTION"],
+            )
+            if should_measure:
+                emit_metrics(
+                    event="visual_kv_selection", mode=visual_mode,
+                    cpu_selection_ms=(perf_counter_ns() - selection_started) / 1e6,
+                )
 
         return {
             "input_ids": input_ids.tolist(),

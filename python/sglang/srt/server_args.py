@@ -2900,6 +2900,15 @@ class ServerArgs:
         return hf_config
 
     def check_server_args(self):
+        if os.getenv("SGLANG_VISUAL_KV_MODE", "legacy") != "legacy":
+            if any(
+                (backend or self.attention_backend) != "flashinfer"
+                for backend in (self.prefill_attention_backend, self.decode_attention_backend)
+            ):
+                raise ValueError("Visual KV modes require the fork's FlashInfer backend for prefill and decode")
+            if self.disaggregation_mode != "null" or self.enable_lora:
+                raise ValueError("Visual KV modes require a single untuned model server")
+
         # Check parallel size constraints
         assert (
             self.tp_size * self.pp_size

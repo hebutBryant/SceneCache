@@ -1,5 +1,6 @@
 # Adapted from qwen2.py
 import logging
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -178,6 +179,46 @@ class Qwen3Attention(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
+    def _forward_visual_kv(self, positions, hidden_states, batch, state):
+        from sglang.srt.mem_cache.scene_graph_memory.optimized_prefill import profile_range
+
+        index = state.compute_indices
+        if self.layer_id == 0:
+            hidden_states = hidden_states.index_select(0, index)
+        with profile_range("scene_kv.qkv_projection"):
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k_new, v_new = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        key, value = state.scratch
+        with profile_range("scene_kv.new_norm_mrope"):
+            q, k_new = self._apply_qk_norm(q, k_new)
+            q, k_new = self.rotary_emb(
+                positions.index_select(1, index), q.contiguous(), k_new.contiguous()
+            )
+        if state.reuse_rows:
+            with profile_range("scene_kv.consume"):
+                raw_key, raw_value = state.raw_pair(self.layer_id)
+            if state.verify:
+                state.observe(self.layer_id, raw_key=raw_key, raw_value=raw_value)
+            with profile_range("scene_kv.restore_norm_mrope"):
+                restored = self.k_norm(raw_key.reshape(-1, self.head_dim)).view(raw_key.shape)
+                reuse = slice(state.reuse_start, state.reuse_stop)
+                _, restored = self.rotary_emb(
+                    positions[:, reuse].contiguous(), torch.empty_like(restored), restored
+                )
+                key[reuse].copy_(restored)
+                value[reuse].copy_(raw_value)
+            with profile_range("scene_kv.prefetch"):
+                state.release(self.layer_id)
+        with profile_range("scene_kv.scatter_new"):
+            key.index_copy_(0, index, k_new)
+            value.index_copy_(0, index, v_new)
+        with profile_range("scene_kv.decoder_attention"):
+            attn_output = self.attn(q, key, value, batch)
+        state.observe(self.layer_id, query=q, key=key, value=value, attention=attn_output)
+        output, _ = self.o_proj(attn_output)
+        return output
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -187,6 +228,10 @@ class Qwen3Attention(nn.Module):
         recompute_info: list[torch.Tensor] = [],
         write_info: list = [],
     ) -> torch.Tensor:
+        if forward_batch.optimized_visual_kv is not None:
+            return self._forward_visual_kv(
+                positions, hidden_states, forward_batch, forward_batch.optimized_visual_kv
+            )
         if recompute_info is not None and self.layer_id in recompute_info:
             if self.is_max_recompute_layer:
                 compute_mask = compute_mask_dict[self.max_recompute_layer_id] #max_compute
@@ -251,9 +296,18 @@ class Qwen3Attention(nn.Module):
                     final_output = torch.zeros((q.shape[0], hidden_states.shape[1]), dtype=hidden_states.dtype, device=hidden_states.device)
                     final_output[relative_mask] = output
                     output = final_output
+            if os.getenv("SGLANG_VISUAL_KV_VERIFY_DIR") and self.is_max_recompute_layer:
+                from sglang.srt.mem_cache.scene_graph_memory.optimized_prefill import observe_legacy_layer
+
+                observe_legacy_layer(
+                    forward_batch, self.layer_id, key=k, value=v, attention=attn_output
+                )
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            capture = forward_batch.scene_graph_capture
+            if capture is not None and capture.bypass:
+                capture.write_layer(self.layer_id, k, v)
             self.maybe_write_kv(k, v, write_info)
             q, k = self._apply_qk_norm(q, k)
             q, k = self.rotary_emb(positions, q, k)
@@ -353,7 +407,9 @@ class Qwen3DecoderLayer(nn.Module):
                 recompute_info=recompute_info,
                 write_info=write_info,
             )
-            if compute_mask is not None and self.self_attn.layer_id in compute_mask:
+            if forward_batch.optimized_visual_kv is not None and residual.shape[0] != hidden_states.shape[0]:
+                residual = residual.index_select(0, forward_batch.optimized_visual_kv.compute_indices)
+            elif compute_mask is not None and self.self_attn.layer_id in compute_mask:
                 if residual.shape[0] != hidden_states.shape[0]:
                     residual = residual[compute_mask[self.self_attn.max_recompute_layer_id]]
 
@@ -368,12 +424,26 @@ class Qwen3DecoderLayer(nn.Module):
                 else None
             ),
         )
-        hidden_states = self.mlp(hidden_states)
+        if forward_batch.optimized_visual_kv is not None:
+            from sglang.srt.mem_cache.scene_graph_memory.optimized_prefill import profile_range
+
+            with profile_range("scene_kv.mlp"):
+                hidden_states = self.mlp(hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states)
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
+        if os.getenv("SGLANG_VISUAL_KV_VERIFY_DIR"):
+            visual = forward_batch.optimized_visual_kv
+            if visual is not None:
+                visual.observe(self.self_attn.layer_id, layer_output=hidden_states)
+            elif recompute_info and self.self_attn.layer_id in recompute_info:
+                from sglang.srt.mem_cache.scene_graph_memory.optimized_prefill import observe_legacy_layer
+
+                observe_legacy_layer(forward_batch, self.self_attn.layer_id, layer_output=hidden_states)
         return hidden_states, residual
 
 

@@ -266,6 +266,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 disable_split_kv=False,
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrappers)
+            if os.getenv("SGLANG_VISUAL_KV_MODE", "").startswith("region_"):
+                from sglang.srt.mem_cache.scene_graph_memory.optimized_prefill import observe_region_decode
+
+                observe_region_decode(forward_batch)
         elif forward_batch.forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -542,6 +546,28 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        visual = forward_batch.optimized_visual_kv
+        if visual is not None and visual.mode == "region_pipeline_triton":
+            from sglang.srt.mem_cache.scene_graph_memory.optimized_prefill import profile_range
+            from sglang.srt.mem_cache.scene_graph_memory.triton_attention import triton_attention
+
+            with profile_range("scene_kv.triton_attention"):
+                output = triton_attention(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                    query_positions=visual.logical_query_positions,
+                    key_positions=visual.logical_key_positions,
+                    key_positions_sorted=True,
+                    scale=layer.scaling,
+                )
+            if save_kv_cache:
+                with profile_range("scene_kv.paged_kv_write"):
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, forward_batch.out_cache_loc, k, v, layer.k_scale, layer.v_scale
+                    )
+            return output.reshape(-1, layer.tp_q_head_num * layer.head_dim)
+
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self.recompute_ratio_in_layer[layer.layer_id]
         ]
@@ -655,9 +681,17 @@ class FlashInferAttnBackend(AttentionBackend):
                 if k is not None:
                     assert v is not None
                     if save_kv_cache:
-                        forward_batch.token_to_kv_pool.set_kv_buffer(
-                            layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                        )
+                        if visual is not None:
+                            from sglang.srt.mem_cache.scene_graph_memory.optimized_prefill import profile_range
+
+                            with profile_range("scene_kv.paged_kv_write"):
+                                forward_batch.token_to_kv_pool.set_kv_buffer(
+                                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                                )
+                        else:
+                            forward_batch.token_to_kv_pool.set_kv_buffer(
+                                layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                            )
             else:
                 o = prefill_wrapper_paged.forward(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -1063,6 +1097,13 @@ class FlashInferIndicesUpdaterPrefill:
         self.kv_size = self.num_kv_heads * self.head_dim
         self.recompute_ratio_in_layer = attn_backend.recompute_ratio_in_layer
         self.max_recompute_layer_id = torch.argmax(torch.tensor(self.recompute_ratio_in_layer)).item()
+        if os.getenv("SGLANG_VISUAL_KV_MODE", "legacy") != "legacy":
+            from pathlib import Path
+
+            from sglang.srt.mem_cache.scene_graph_memory.optimized_prefill import validate_server
+
+            validate_server(model_runner)
+            self.visual_kv_model_path = str(Path(model_runner.server_args.model_path).resolve())
 
     def update(
         self,
@@ -1093,6 +1134,12 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         forward_batch,
     ):
+        if os.getenv("SGLANG_VISUAL_KV_MODE", "legacy") != "legacy":
+            from sglang.srt.mem_cache.scene_graph_memory.optimized_prefill import start_optimized_prefill
+
+            if start_optimized_prefill(self, forward_batch, prefill_wrappers, use_ragged):
+                return
+
         # here consider different layer may have different sparse pattern, this can be more concise if sparse pattern is all the same
         block_compute_list = [[] for i in self.layer_ids]
         block_compute_list_valid_cumsum = [[] for i in self.layer_ids]
@@ -1103,11 +1150,23 @@ class FlashInferIndicesUpdaterPrefill:
         compute_mask = {}
         recompute_info = {}
         write_info = {}
+
+        graph_capture = None
+        capture_dir = os.getenv("SGLANG_SCENE_GRAPH_CAPTURE_DIR")
+        if capture_dir and forward_batch.forward_mode.is_extend():
+            from sglang.srt.mem_cache.scene_graph_memory.capture import PrefillCapture
+
+            graph_capture = PrefillCapture(capture_dir, forward_batch, self.layer_ids)
+            forward_batch.scene_graph_capture = graph_capture
+        bypass_image_cache = graph_capture is not None and graph_capture.bypass
+        decoder_cache_disabled = os.getenv("SGLANG_VISUAL_KV_DISABLE_DECODER_CACHE") == "1"
+        bypass_image_cache = bypass_image_cache or decoder_cache_disabled
         
         if forward_batch.forward_mode.is_extend():
-            compute_mask_list = [torch.ones(forward_batch.input_ids.shape[0], dtype=torch.bool, device=forward_batch.input_ids.device) for i in self.layer_ids] #here can use empty? 
-            retrived_k_list = [torch.zeros((forward_batch.input_ids.shape[0], self.kv_size), dtype=self.data_type, device=forward_batch.input_ids.device) for i in self.layer_ids]
-            retrived_v_list = [torch.zeros((forward_batch.input_ids.shape[0], self.kv_size), dtype=self.data_type, device=forward_batch.input_ids.device) for i in self.layer_ids]
+            if not decoder_cache_disabled:
+                compute_mask_list = [torch.ones(forward_batch.input_ids.shape[0], dtype=torch.bool, device=forward_batch.input_ids.device) for i in self.layer_ids]
+                retrived_k_list = [torch.zeros((forward_batch.input_ids.shape[0], self.kv_size), dtype=self.data_type, device=forward_batch.input_ids.device) for i in self.layer_ids]
+                retrived_v_list = [torch.zeros((forward_batch.input_ids.shape[0], self.kv_size), dtype=self.data_type, device=forward_batch.input_ids.device) for i in self.layer_ids]
 
             for mm_inputs, prefix_len, start_loc, seq_len, orig_seq_len in zip(forward_batch.mm_inputs, 
                                                                                forward_batch.extend_prefix_lens_cpu,
@@ -1122,6 +1181,10 @@ class FlashInferIndicesUpdaterPrefill:
                 if mm_inputs is None:
                     continue
                 for item in mm_inputs.mm_items:
+                    if bypass_image_cache:
+                        # The entire image span stays in the ordinary dense extend block.
+                        # Do not read or write the fork's shared image cache for this request.
+                        continue
                     for cur_hash, (start_idx, end_idx) in zip(item.split_hash, item.offsets):
                         start_idx -= prefix_len
                         end_idx -= prefix_len
@@ -1150,8 +1213,15 @@ class FlashInferIndicesUpdaterPrefill:
                                 part_v = retrived_v_list[layer_id][start_loc + start_idx: start_loc + reuse_end]
                                 torch.cuda.synchronize() #this is essential to initialize tensor in cuda to avoid get wrong data from pace
                                 assert part_k.shape[0] == reuse_end - start_idx
-                                self.mock_kv_manager.get_kv(part_k, uid_k, non_blocking=False)
-                                self.mock_kv_manager.get_kv(part_v, uid_v, non_blocking=False)
+                                if os.getenv("SGLANG_VISUAL_KV_PROFILE"):
+                                    from sglang.srt.mem_cache.scene_graph_memory.optimized_prefill import profile_range
+
+                                    with profile_range("scene_kv.sync_h2d"):
+                                        self.mock_kv_manager.get_kv(part_k, uid_k, non_blocking=False)
+                                        self.mock_kv_manager.get_kv(part_v, uid_v, non_blocking=False)
+                                else:
+                                    self.mock_kv_manager.get_kv(part_k, uid_k, non_blocking=False)
+                                    self.mock_kv_manager.get_kv(part_v, uid_v, non_blocking=False)
                                 
                                 # fixme: here assume all req in a batch either all cached, or all no cached
                                 reuse_happened=True
@@ -1212,6 +1282,8 @@ class FlashInferIndicesUpdaterPrefill:
         forward_batch.compute_mask = compute_mask
         forward_batch.recompute_info = recompute_info
         forward_batch.write_info = write_info
+        if graph_capture is not None:
+            graph_capture.observe_plan(compute_mask, recompute_info, write_info)
         if actual_extend_seq_len != []:
             forward_batch.actual_extend_seq_len = torch.tensor(actual_extend_seq_len, dtype=torch.int32).cuda()
         

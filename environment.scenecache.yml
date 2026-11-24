@@ -1,0 +1,15 @@
+# Recreate from the repository root with:
+# PIP_BUILD_CONSTRAINT="$PWD/build-constraints.scenecache.txt" conda env create -f environment.scenecache.yml
+name: scenecache
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - -r requirements.scenecache.txt
+      - -e ./python
+variables:
+  CUDA_HOME: /usr/local/cuda-12.8
+  CUDACXX: /usr/local/cuda-12.8/bin/nvcc
+  CUDA_TOOLKIT_ROOT_DIR: /usr/local/cuda-12.8

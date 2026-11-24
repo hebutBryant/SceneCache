@@ -14,6 +14,7 @@
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import logging
+import os
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Literal, Optional, Tuple, TypedDict, Union
 
@@ -38,7 +39,7 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_vl import Qwen2VLVideoInputs
@@ -577,7 +578,10 @@ class Qwen3LLMModel(Qwen3Model):
                 and layer_idx in self.deepstack_embed_to_decoder_layer
             ):
                 sep = self.hidden_size * layer_idx
-                if compute_mask is not None and layer_idx in compute_mask:
+                if forward_batch.optimized_visual_kv is not None:
+                    index = forward_batch.optimized_visual_kv.compute_indices
+                    hidden_states = hidden_states + input_deepstack_embeds[:, sep : sep + self.hidden_size].index_select(0, index)
+                elif compute_mask is not None and layer_idx in compute_mask:
                     # here fix for adaptive recompute, use the max recompute ratio because hidden state is passed as it is, maybe can be improve.
                     hidden_states = (
                         hidden_states
@@ -675,13 +679,17 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
-    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+    def get_image_feature(
+        self, items: List[MultimodalDataItem], *, bypass_cache: bool = False
+    ) -> torch.Tensor:
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
 
+        if bypass_cache or os.getenv("SGLANG_VISUAL_KV_DISABLE_VISION_CACHE") == "1":
+            return self.visual(pixel_values, grid_thw=image_grid_thw)
         if len(items) == 1:
             image_mask = torch.ones(image_grid_thw.shape[0]).bool()
             cur_image = 0
@@ -780,21 +788,45 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
-        hidden_states = general_mm_embed_routine(
-            input_ids=input_ids,
-            forward_batch=forward_batch,
-            language_model=self.model,
-            multimodal_model=self,
-            positions=positions,
-            use_deepstack=self.use_deepstack,
-        )
+        capture = forward_batch.scene_graph_capture
+        embedders = None
+        if capture is not None:
+            def observe_image_embedding(items):
+                features = self.get_image_feature(items, bypass_cache=capture.bypass)
+                capture.observe_embedding(features, self.visual)
+                return features
 
-        if not get_embedding:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+            embedders = {Modality.IMAGE: observe_image_embedding}
+
+        visual = forward_batch.optimized_visual_kv
+        try:
+            hidden_states = general_mm_embed_routine(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                language_model=self.model,
+                multimodal_model=self,
+                positions=positions,
+                use_deepstack=self.use_deepstack,
+                data_embedding_funcs=embedders,
             )
-        else:
+
+            if not get_embedding:
+                output = self.logits_processor(
+                    input_ids, hidden_states, self.lm_head, forward_batch
+                )
+                if capture is not None:
+                    capture.finish(output.next_token_logits)
+                if visual is not None:
+                    visual.finish(output)
+                elif os.getenv("SGLANG_VISUAL_KV_VERIFY_DIR"):
+                    from sglang.srt.mem_cache.scene_graph_memory.optimized_prefill import finish_legacy_probes
+
+                    finish_legacy_probes(forward_batch, output)
+                return output
             return self.pooler(hidden_states, forward_batch)
+        finally:
+            if visual is not None:
+                visual.close()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

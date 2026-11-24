@@ -5,6 +5,8 @@ This is the official usage guide for VLCache. For details, please refer to the p
 
 VLCache enables efficient vision-language inference by reusing previously computed vision tokens KV caches across requests. This example shows how to run VLCache on Qwen3-VL-8B-Instruct model.
 
+For a persisted single-image source bank and region graph, see [Scene graph visual KV memory](scene_graph_memory.md).
+
 ## 1. Launch Qwen3-VL model with SGLang
 
 ```bash
@@ -104,5 +106,7 @@ By default, **recompute ratio** is set to 0.3 per layer. You can customize this 
   - A **float** between `0.0` and `1.0` (applies uniformly to all layers), or  
   - A **list of floats** with length equal to the number of model layers (e.g., 36 for Qwen-VL-8B).
 - If using a list, the values **must be non-increasing** (i.e., `ratio[i] >= ratio[i+1]`).
+
+For the optional full-KV transfer pipeline and region-selected inference, see [Visual KV inference in SceneCache](scene_graph_inference.md).
 
 
